@@ -5,6 +5,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     ghc \
     cabal-install \
+    libghc-aeson-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
