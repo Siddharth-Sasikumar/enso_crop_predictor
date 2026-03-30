@@ -15,7 +15,7 @@ BASE_DIR        = Path(__file__).resolve().parent
 DATA_PATH       = BASE_DIR / "final_crop_dataset_complete.csv"
 PREDICT_SCRIPT  = BASE_DIR / "python" / "predict.py"
 HASKELL_DIR     = BASE_DIR / "haskell"
-HASKELL_SRC     = HASKELL_DIR / "crop_recommend.hs"
+HASKELL_SCRIPT = HASKELL_DIR / "crop_recommend.hs"
 
 # FIX: Use compiled binary if available; fall back to runhaskell
 HASKELL_BINARY  = HASKELL_DIR / "crop_recommend"
@@ -138,28 +138,40 @@ def run_python_prediction(state, season, year, enso_mode, manual_phase=None):
 # FIX: Sends via stdin (matches getLine in Haskell)
 # ============================================
 
-def run_haskell_recommendation(state, season, crop, binary_ready):
-    # Haskell reads 3 lines from stdin
-    input_data = f"{state}\n{season}\n{crop}\n"
+def run_haskell_crop_recommend(state, season, crop):
+    if not HASKELL_SCRIPT.exists():
+        return {"error": f"Haskell script not found: {HASKELL_SCRIPT}"}
 
-    if binary_ready and HASKELL_BINARY.exists():
-        cmd = [str(HASKELL_BINARY)]
-    else:
-        cmd = ["runhaskell", HASKELL_SRC.name]
+    try:
+        result = subprocess.run(
+            ["runhaskell", str(HASKELL_SCRIPT), state, season, crop],
+            cwd=str(HASKELL_DIR),
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
 
-    result = subprocess.run(
-        cmd,
-        input=input_data,
-        capture_output=True,
-        text=True,
-        cwd=str(HASKELL_DIR)
-    )
+        if result.returncode != 0:
+            return {
+                "error": "Haskell program failed",
+                "stderr": result.stderr,
+                "stdout": result.stdout
+            }
 
-    if result.returncode != 0:
-        error_msg = result.stderr.strip() or "Haskell recommendation failed."
-        raise RuntimeError(error_msg)
+        output = result.stdout.strip()
+        if not output:
+            return {"error": "Haskell program returned empty output"}
 
-    return result.stdout
+        try:
+            return json.loads(output)
+        except json.JSONDecodeError:
+            return {
+                "error": "Invalid JSON returned by Haskell program",
+                "raw_output": output
+            }
+
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ============================================
