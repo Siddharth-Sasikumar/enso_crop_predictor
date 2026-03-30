@@ -8,7 +8,7 @@ import streamlit as st
 
 st.set_page_config(
     page_title="ENSO Agricultural Risk Predictor",
-    page_icon="🌦️",
+    page_icon="🌾",
     layout="wide"
 )
 
@@ -17,6 +17,119 @@ DATA_PATH = BASE_DIR / "final_crop_dataset_complete.csv"
 PREDICT_SCRIPT = BASE_DIR / "python" / "predict.py"
 HASKELL_DIR = BASE_DIR / "haskell"
 HASKELL_SCRIPT = HASKELL_DIR / "crop_recommend.hs"
+
+
+st.markdown("""
+<style>
+.block-container {
+    padding-top: 1.5rem;
+    padding-bottom: 2rem;
+    max-width: 1200px;
+}
+
+.main-title {
+    font-size: 2.2rem;
+    font-weight: 800;
+    margin-bottom: 0.2rem;
+}
+
+.subtitle {
+    color: #9ca3af;
+    font-size: 1rem;
+    margin-bottom: 1.2rem;
+}
+
+.status-bar {
+    padding: 14px 18px;
+    border-radius: 14px;
+    margin: 12px 0 18px 0;
+    font-weight: 600;
+    border: 1px solid transparent;
+}
+
+.status-good {
+    background: linear-gradient(90deg, rgba(34,197,94,0.18), rgba(34,197,94,0.07));
+    border-color: rgba(34,197,94,0.35);
+    color: #dcfce7;
+}
+
+.status-bad {
+    background: linear-gradient(90deg, rgba(239,68,68,0.18), rgba(239,68,68,0.07));
+    border-color: rgba(239,68,68,0.35);
+    color: #fee2e2;
+}
+
+.status-warn {
+    background: linear-gradient(90deg, rgba(245,158,11,0.18), rgba(245,158,11,0.07));
+    border-color: rgba(245,158,11,0.35);
+    color: #fef3c7;
+}
+
+.summary-card {
+    background: linear-gradient(135deg, rgba(30,41,59,0.70), rgba(15,23,42,0.92));
+    border: 1px solid rgba(148,163,184,0.18);
+    border-radius: 18px;
+    padding: 20px 22px;
+    margin: 14px 0 18px 0;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.18);
+}
+
+.summary-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    margin-bottom: 10px;
+    color: #f8fafc;
+}
+
+.summary-pre {
+    white-space: pre-wrap;
+    font-family: "Courier New", monospace;
+    font-size: 0.96rem;
+    line-height: 1.7;
+    margin: 0;
+    color: #e5e7eb;
+}
+
+.section-card-good {
+    background: linear-gradient(135deg, rgba(34,197,94,0.09), rgba(22,163,74,0.04));
+    border: 1px solid rgba(34,197,94,0.22);
+    border-radius: 18px;
+    padding: 16px 16px 8px 16px;
+    margin-top: 10px;
+    margin-bottom: 18px;
+}
+
+.section-card-bad {
+    background: linear-gradient(135deg, rgba(239,68,68,0.09), rgba(185,28,28,0.04));
+    border: 1px solid rgba(239,68,68,0.22);
+    border-radius: 18px;
+    padding: 16px 16px 8px 16px;
+    margin-top: 10px;
+    margin-bottom: 18px;
+}
+
+.section-title-good {
+    font-size: 1.2rem;
+    font-weight: 800;
+    color: #86efac;
+    margin-bottom: 10px;
+}
+
+.section-title-bad {
+    font-size: 1.2rem;
+    font-weight: 800;
+    color: #fca5a5;
+    margin-bottom: 10px;
+}
+
+.metric-card {
+    background: linear-gradient(135deg, rgba(30,41,59,0.70), rgba(15,23,42,0.92));
+    border: 1px solid rgba(148,163,184,0.18);
+    border-radius: 16px;
+    padding: 16px;
+}
+</style>
+""", unsafe_allow_html=True)
 
 
 @st.cache_data
@@ -49,8 +162,7 @@ def load_metadata():
     states = sorted(df[state_col].dropna().astype(str).unique().tolist())
     seasons = sorted(df[season_col].dropna().astype(str).unique().tolist())
     years = sorted(
-        pd.to_numeric(df[year_col], errors="coerce")
-        .dropna().astype(int).unique().tolist()
+        pd.to_numeric(df[year_col], errors="coerce").dropna().astype(int).unique().tolist()
     )
     crops = sorted(df[crop_col].dropna().astype(str).unique().tolist()) if crop_col else []
 
@@ -174,16 +286,18 @@ def split_haskell_output(raw_text):
     risky_df = parse_crop_table(risky_lines)
 
     cleaned_text = []
+    skip_modes = [
+        "top 3 safer alternatives",
+        "top 3 riskiest crops"
+    ]
+
     for line in raw_text.splitlines():
         low = line.lower().strip()
 
-        if low.startswith("top 3 safer alternatives"):
-            continue
-        if low.startswith("top 3 riskiest crops"):
+        if any(low.startswith(x) for x in skip_modes):
             continue
 
-        is_table_row = "| Risk:" in line and "| Est. Yield:" in line
-        if is_table_row:
+        if "| Risk:" in line and "| Est. Yield:" in line:
             continue
 
         cleaned_text.append(line)
@@ -195,9 +309,45 @@ def split_haskell_output(raw_text):
     }
 
 
+def make_status_badge(text):
+    t = text.lower()
+    if "not cultivated" in t or "not suitable" in t:
+        return "bad", "🔴 High caution"
+    if "safe" in t or "safer" in t or "suitable" in t:
+        return "good", "🟢 Favourable"
+    return "warn", "🟡 Mixed / review needed"
+
+
+def styled_dataframe(df, good=True):
+    if df.empty:
+        return df
+
+    df = df.copy().reset_index(drop=True)
+    df.index = df.index + 1
+    df["Risk Score"] = df["Risk Score"].map(lambda x: f"{x:.2f}")
+    df["Estimated Yield (tons/ha)"] = df["Estimated Yield (tons/ha)"].map(lambda x: f"{x:.2f}")
+
+    def color_risk_level(val):
+        v = str(val).upper()
+        if v in ["LOW", "VERY LOW"]:
+            return "color: #86efac; font-weight: 700;"
+        if v in ["MEDIUM", "MODERATE"]:
+            return "color: #fcd34d; font-weight: 700;"
+        if v in ["HIGH", "VERY HIGH"]:
+            return "color: #fca5a5; font-weight: 700;"
+        return ""
+
+    def color_crop(_):
+        return "color: #bbf7d0; font-weight: 600;" if good else "color: #fecaca; font-weight: 600;"
+
+    return df.style \
+        .applymap(color_crop, subset=["Crop"]) \
+        .applymap(color_risk_level, subset=["Risk Level"])
+
+
 def main():
-    st.title("🌦️ ENSO Agricultural Risk Predictor")
-    st.caption("Python predicts rainfall & ENSO → Haskell recommends crops.")
+    st.markdown('<div class="main-title">🌾 Crop Recommendation</div>', unsafe_allow_html=True)
+    st.markdown('<div class="subtitle">ENSO-based agricultural risk and crop suitability dashboard</div>', unsafe_allow_html=True)
 
     try:
         states, seasons, years, crops, state_col, season_col = load_metadata()
@@ -217,9 +367,9 @@ def main():
 
         valid_combo, record_count = validate_combo(df_raw, state_col, season_col, state, season)
         if valid_combo:
-            st.success(f"✅ {record_count} records for this combination")
+            st.success(f"✅ {record_count} records found")
         else:
-            st.error("❌ No data for this State + Season combination. Haskell will not run.")
+            st.error("❌ No data for this State + Season combination")
 
         enso_mode = st.selectbox("ENSO Mode", ["historical", "live", "manual"])
         manual_phase = None
@@ -251,7 +401,7 @@ def main():
             disabled=not valid_combo
         )
 
-    st.subheader("📊 Dataset Coverage")
+    st.subheader("📊 Dataset Overview")
     c1, c2, c3 = st.columns(3)
     c1.metric("States", len(states))
     c2.metric("Seasons", len(seasons))
@@ -261,7 +411,7 @@ def main():
 
     if run_btn:
         try:
-            with st.spinner("⏳ Running Python climate prediction..."):
+            with st.spinner("Running Python climate prediction..."):
                 py_result = run_python_prediction(
                     state=state,
                     season=season,
@@ -269,9 +419,8 @@ def main():
                     enso_mode=enso_mode,
                     manual_phase=manual_phase
                 )
-            st.success("✅ Python prediction completed.")
 
-            st.markdown("## 🌧️ Climate Prediction")
+            st.subheader("🌧️ Climate Prediction")
             p1, p2, p3 = st.columns(3)
             p1.metric("Predicted Rainfall (mm)", py_result["predicted_rainfall_mm"])
             p2.metric("ENSO Phase", py_result["enso_phase"])
@@ -280,17 +429,11 @@ def main():
             p4, p5, p6 = st.columns(3)
             p4.metric("Historical Normal (mm)", py_result["historical_normal_mm"])
             p5.metric("Anomaly (%)", py_result["anomaly_pct"])
-            p6.metric(
-                "ONI Value",
-                py_result["oni_value"] if py_result["oni_value"] is not None else "N/A"
-            )
-
-            with st.expander("📄 Full JSON response"):
-                st.json(py_result)
+            p6.metric("ONI Value", py_result["oni_value"] if py_result["oni_value"] is not None else "N/A")
 
             st.markdown("---")
 
-            with st.spinner("⏳ Running Haskell crop recommendation..."):
+            with st.spinner("Running Haskell crop recommendation..."):
                 hs_result = run_haskell_crop_recommend(state, season, crop)
 
             if "error" in hs_result:
@@ -300,40 +443,79 @@ def main():
                 if "stdout" in hs_result and hs_result["stdout"]:
                     st.code(hs_result["stdout"], language="text")
             else:
-                st.success("✅ Haskell recommendation completed.")
-                st.markdown("## 🌾 Crop Recommendation")
-
                 parsed = split_haskell_output(hs_result["output"])
 
-                if parsed["cleaned_text"]:
-                    st.code(parsed["cleaned_text"], language="text")
+                summary_lines = []
+                for line in parsed["cleaned_text"].splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if "| Risk:" in line and "| Est. Yield:" in line:
+                        continue
+                    if line.startswith("==="):
+                        continue
+                    summary_lines.append(line)
 
-                col1, col2 = st.columns(2)
+                summary_text = "\n".join(summary_lines)
 
-                with col1:
-                    st.markdown("### Recommended Alternatives")
-                    if not parsed["safer_df"].empty:
-                        st.table(parsed["safer_df"])
-                    else:
-                        st.info("No safer crop alternatives found.")
+                badge_type, badge_text = make_status_badge(summary_text)
+                badge_class = {
+                    "good": "status-good",
+                    "bad": "status-bad",
+                    "warn": "status-warn"
+                }[badge_type]
 
-                with col2:
-                    st.markdown("### High-Risk Crops")
-                    if not parsed["risky_df"].empty:
-                        st.table(parsed["risky_df"])
-                    else:
-                        st.info("No risky crop comparison available.")
+                st.markdown(
+                    f'<div class="status-bar {badge_class}">{badge_text}</div>',
+                    unsafe_allow_html=True
+                )
+
+                st.markdown("## 🌾 Crop Recommendation")
+
+                if summary_text:
+                    st.markdown(
+                        f"""
+<div class="summary-card">
+    <div class="summary-title">Recommendation Summary</div>
+    <pre class="summary-pre">{summary_text}</pre>
+</div>
+""",
+                        unsafe_allow_html=True
+                    )
+
+                st.markdown('<div class="section-card-good">', unsafe_allow_html=True)
+                st.markdown('<div class="section-title-good">✅ Recommended Alternatives</div>', unsafe_allow_html=True)
+                if not parsed["safer_df"].empty:
+                    st.dataframe(
+                        styled_dataframe(parsed["safer_df"], good=True),
+                        use_container_width=True,
+                        height=180
+                    )
+                else:
+                    st.info("No recommended alternatives found.")
+                st.markdown('</div>', unsafe_allow_html=True)
+
+                st.markdown('<div class="section-card-bad">', unsafe_allow_html=True)
+                st.markdown('<div class="section-title-bad">⚠️ High-Risk Crops</div>', unsafe_allow_html=True)
+                if not parsed["risky_df"].empty:
+                    st.dataframe(
+                        styled_dataframe(parsed["risky_df"], good=False),
+                        use_container_width=True,
+                        height=180
+                    )
+                else:
+                    st.info("No high-risk crops found.")
+                st.markdown('</div>', unsafe_allow_html=True)
+
+                with st.expander("View raw Haskell output"):
+                    st.code(hs_result["output"], language="text")
 
         except Exception as e:
             st.error(f"❌ Pipeline failed: {e}")
 
     else:
-        st.markdown("## How it works")
-        st.write(
-            "1. Choose your State, Season, Crop, and ENSO mode in the sidebar.\n"
-            "2. Python predicts ENSO and rainfall and writes `forecast.json`.\n"
-            "3. Haskell reads `forecast.json` and returns crop risk + recommendations.\n"
-            "4. Results appear here."
+        st.info(
+            "Select State, Season, Crop, and ENSO mode from the sidebar, then click 'Run Full Prediction'."
         )
 
 
