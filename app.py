@@ -18,7 +18,7 @@ HASKELL_DIR     = BASE_DIR / "haskell"
 HASKELL_SCRIPT = HASKELL_DIR / "crop_recommend.hs"
 
 # FIX: Use compiled binary if available; fall back to runhaskell
-HASKELL_BINARY  = HASKELL_DIR / "crop_recommend"
+HASKELL_BINARY = HASKELL_DIR / "crop_recommend"
 
 
 # ============================================
