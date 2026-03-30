@@ -5,129 +5,298 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+st.set_page_config(
+    page_title="ENSO Agricultural Risk Predictor",
+    page_icon="🌦️",
+    layout="wide"
+)
 
-BASE_DIR = Path(__file__).resolve().parent
-HASKELL_DIR = BASE_DIR / "haskell"
-HASKELL_BINARY = HASKELL_DIR / "crop_recommend"
-DATASET_PATH = BASE_DIR / "final_crop_dataset_complete.csv"
-FORECAST_PATH = BASE_DIR / "forecast.json"
+BASE_DIR        = Path(__file__).resolve().parent
+DATA_PATH       = BASE_DIR / "final_crop_dataset_complete.csv"
+PREDICT_SCRIPT  = BASE_DIR / "python" / "predict.py"
+HASKELL_DIR     = BASE_DIR / "haskell"
+HASKELL_SRC     = HASKELL_DIR / "crop_recommend.hs"
+
+# FIX: Use compiled binary if available; fall back to runhaskell
+HASKELL_BINARY  = HASKELL_DIR / "crop_recommend"
 
 
-st.set_page_config(page_title="ENSO Crop Predictor", layout="wide")
-st.title("ENSO Crop Predictor")
+# ============================================
+# COMPILE HASKELL ONCE PER SESSION
+# FIX: avoids recompiling on every request
+# ============================================
+
+@st.cache_resource
+def compile_haskell():
+    """
+    Compiles the Haskell script to a binary on first run.
+    Returns True if binary is ready, False if compilation failed.
+    """
+    if HASKELL_BINARY.exists():
+        return True, "Pre-compiled binary found."
+
+    if not HASKELL_SRC.exists():
+        return False, f"Haskell source not found at {HASKELL_SRC}"
+
+    result = subprocess.run(
+        ["ghc", "-O2", "-o", str(HASKELL_BINARY), str(HASKELL_SRC)],
+        capture_output=True, text=True, cwd=str(HASKELL_DIR)
+    )
+
+    if result.returncode == 0:
+        return True, "Compiled successfully."
+    else:
+        # Fall back gracefully to runhaskell
+        return False, result.stderr.strip()
+
+
+# ============================================
+# DATA LOADING
+# ============================================
+
+@st.cache_data
+def load_dataset():
+    if not DATA_PATH.exists():
+        raise FileNotFoundError(f"Dataset not found: {DATA_PATH}")
+    return pd.read_csv(DATA_PATH)
+
+
+def find_column(df, candidates):
+    for c in df.columns:
+        if c.lower().strip() in candidates:
+            return c
+    return None
 
 
 @st.cache_data
-def load_data():
-    return pd.read_csv(DATASET_PATH)
+def load_metadata():
+    df = load_dataset()
 
+    state_col  = find_column(df, {"state", "state_name", "state name"})
+    season_col = find_column(df, {"season", "season_name"})
+    year_col   = find_column(df, {"year", "crop_year", "cropyear"})
+    crop_col   = find_column(df, {"crop", "crop_name", "crop name"})
 
-def load_forecast():
-    if FORECAST_PATH.exists():
-        try:
-            with open(FORECAST_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+    for col, name in [(state_col, "State"), (season_col, "Season"), (year_col, "Year")]:
+        if col is None:
+            raise ValueError(f"{name} column not found in dataset.")
 
-
-def run_haskell_crop_recommend(state, season, crop):
-    if not HASKELL_BINARY.exists():
-        return {"error": f"Haskell binary not found: {HASKELL_BINARY}"}
-
-    try:
-        result = subprocess.run(
-            [str(HASKELL_BINARY), state, season, crop],
-            cwd=str(HASKELL_DIR),
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-
-        if result.returncode != 0:
-            return {
-                "error": "Haskell program failed",
-                "stderr": result.stderr,
-                "stdout": result.stdout
-            }
-
-        output = result.stdout.strip()
-        if not output:
-            return {"error": "Haskell program returned empty output"}
-
-        try:
-            return json.loads(output)
-        except json.JSONDecodeError:
-            return {
-                "error": "Invalid JSON returned by Haskell program",
-                "raw_output": output
-            }
-
-    except Exception as e:
-        return {"error": str(e)}
-
-
-df = load_data()
-forecast = load_forecast()
-
-st.subheader("Dataset Preview")
-st.dataframe(df.head())
-
-states = sorted(df["State"].dropna().unique().tolist()) if "State" in df.columns else []
-seasons = sorted(df["Season"].dropna().unique().tolist()) if "Season" in df.columns else []
-crops = sorted(df["Crop"].dropna().unique().tolist()) if "Crop" in df.columns else []
-
-st.subheader("Crop Recommendation")
-
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    selected_state = st.selectbox("State", states if states else ["Tamil Nadu"])
-
-with col2:
-    selected_season = st.selectbox("Season", seasons if seasons else ["Kharif"])
-
-with col3:
-    selected_crop = st.selectbox("Crop", crops if crops else ["Rice"])
-
-if st.button("Predict / Recommend"):
-    response = run_haskell_crop_recommend(
-        selected_state,
-        selected_season,
-        selected_crop
+    states  = sorted(df[state_col].dropna().astype(str).unique().tolist())
+    seasons = sorted(df[season_col].dropna().astype(str).unique().tolist())
+    years   = sorted(
+        pd.to_numeric(df[year_col], errors="coerce")
+        .dropna().astype(int).unique().tolist()
+    )
+    crops = (
+        sorted(df[crop_col].dropna().astype(str).unique().tolist())
+        if crop_col else []
     )
 
-    if "error" in response:
-        st.error(response["error"])
-        if "stderr" in response:
-            st.code(response["stderr"])
-        if "stdout" in response:
-            st.code(response["stdout"])
-        if "raw_output" in response:
-            st.code(response["raw_output"])
+    return states, seasons, years, crops, state_col, season_col
+
+
+# ============================================
+# FIX: Input validation before calling Haskell
+# ============================================
+
+def validate_combo(df, state_col, season_col, state, season):
+    """Returns True if the state+season combo has records in the dataset."""
+    sub = df[
+        (df[state_col].astype(str) == state) &
+        (df[season_col].astype(str) == season)
+    ]
+    return len(sub) > 0, len(sub)
+
+
+# ============================================
+# PYTHON PREDICTION
+# ============================================
+
+def run_python_prediction(state, season, year, enso_mode, manual_phase=None):
+    cmd = [
+        "python", str(PREDICT_SCRIPT),
+        "--state",     state,
+        "--season",    season,
+        "--year",      str(year),
+        "--enso-mode", enso_mode
+    ]
+
+    if enso_mode == "manual" and manual_phase:
+        cmd.extend(["--manual-phase", manual_phase])
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "Python prediction failed.")
+
+    return json.loads(result.stdout)
+
+
+# ============================================
+# HASKELL RECOMMENDATION
+# FIX: Uses compiled binary; falls back to runhaskell
+# FIX: Sends via stdin (matches getLine in Haskell)
+# ============================================
+
+def run_haskell_recommendation(state, season, crop, binary_ready):
+    # Haskell reads 3 lines from stdin
+    input_data = f"{state}\n{season}\n{crop}\n"
+
+    if binary_ready and HASKELL_BINARY.exists():
+        cmd = [str(HASKELL_BINARY)]
     else:
-        st.success("Prediction generated successfully")
-        st.json(response)
+        cmd = ["runhaskell", HASKELL_SRC.name]
 
-        if isinstance(response, dict):
-            if "crop" in response:
-                st.write(f"**Crop:** {response['crop']}")
-            if "state" in response:
-                st.write(f"**State:** {response['state']}")
-            if "season" in response:
-                st.write(f"**Season:** {response['season']}")
-            if "ensoPhase" in response:
-                st.write(f"**ENSO Phase:** {response['ensoPhase']}")
-            if "expectedYield" in response:
-                st.write(f"**Expected Yield:** {response['expectedYield']}")
-            if "riskLevel" in response:
-                st.write(f"**Risk Level:** {response['riskLevel']}")
-            if "explanation" in response:
-                st.info(response["explanation"])
+    result = subprocess.run(
+        cmd,
+        input=input_data,
+        capture_output=True,
+        text=True,
+        cwd=str(HASKELL_DIR)
+    )
 
-st.subheader("Forecast Data")
-if forecast:
-    st.json(forecast)
-else:
-    st.info("No forecast.json found or file is empty.")
+    if result.returncode != 0:
+        error_msg = result.stderr.strip() or "Haskell recommendation failed."
+        raise RuntimeError(error_msg)
+
+    return result.stdout
+
+
+# ============================================
+# APP
+# ============================================
+
+def main():
+    st.title("🌦️ ENSO Agricultural Risk Predictor")
+    st.caption("Python predicts rainfall & ENSO → Haskell recommends crops.")
+
+    # Compile Haskell once
+    binary_ready, compile_msg = compile_haskell()
+    if binary_ready:
+        st.sidebar.success(f"✅ Haskell: {compile_msg}")
+    else:
+        st.sidebar.warning(f"⚠️ Haskell using runhaskell (slower): {compile_msg}")
+
+    try:
+        states, seasons, years, crops, state_col, season_col = load_metadata()
+        df_raw = load_dataset()
+    except Exception as e:
+        st.error(f"Failed to load dataset: {e}")
+        st.stop()
+
+    latest_hist_year = max(years)
+
+    # ---- SIDEBAR ----
+    with st.sidebar:
+        st.header("⚙️ Inputs")
+
+        state  = st.selectbox("State",  states)
+        season = st.selectbox("Season", seasons)
+        crop   = (
+            st.selectbox("Crop", crops)
+            if crops else st.text_input("Crop")
+        )
+
+        # FIX: Validate state+season combo immediately
+        valid_combo, record_count = validate_combo(df_raw, state_col, season_col, state, season)
+        if valid_combo:
+            st.success(f"✅ {record_count} records for this combination")
+        else:
+            st.error("❌ No data for this State + Season combination. "
+                     "Haskell will not run.")
+
+        enso_mode    = st.selectbox("ENSO Mode", ["historical", "live", "manual"])
+        manual_phase = None
+
+        if enso_mode == "historical":
+            year = st.selectbox("Historical Year", years, index=len(years) - 1)
+        elif enso_mode == "live":
+            year = st.number_input(
+                "Prediction Year",
+                min_value=latest_hist_year + 1,
+                max_value=2100,
+                value=max(2026, latest_hist_year + 1),
+                step=1
+            )
+        else:
+            year = st.number_input(
+                "Scenario Year",
+                min_value=latest_hist_year + 1,
+                max_value=2100,
+                value=max(2026, latest_hist_year + 1),
+                step=1
+            )
+            manual_phase = st.selectbox(
+                "Manual ENSO Phase", ["El Nino", "Neutral", "La Nina"]
+            )
+
+        run_btn = st.button(
+            "▶ Run Full Prediction",
+            type="primary",
+            use_container_width=True,
+            disabled=not valid_combo      # FIX: disable if combo invalid
+        )
+
+    # ---- METRICS ----
+    st.subheader("📊 Dataset Coverage")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("States",           len(states))
+    c2.metric("Seasons",          len(seasons))
+    c3.metric("Historical Years", f"{min(years)} – {max(years)}")
+
+    st.markdown("---")
+
+    # ---- RUN ----
+    if run_btn:
+        try:
+            with st.spinner("⏳ Running Python climate prediction..."):
+                py_result = run_python_prediction(
+                    state=state,
+                    season=season,
+                    year=year,
+                    enso_mode=enso_mode,
+                    manual_phase=manual_phase
+                )
+            st.success("✅ Python prediction completed.")
+
+            st.markdown("## 🌧️ Climate Prediction")
+            p1, p2, p3 = st.columns(3)
+            p1.metric("Predicted Rainfall (mm)", py_result["predicted_rainfall_mm"])
+            p2.metric("ENSO Phase",              py_result["enso_phase"])
+            p3.metric("Rainfall Category",       py_result["rainfall_category"])
+
+            p4, p5, p6 = st.columns(3)
+            p4.metric("Historical Normal (mm)", py_result["historical_normal_mm"])
+            p5.metric("Anomaly (%)",            py_result["anomaly_pct"])
+            p6.metric("ONI Value",
+                      py_result["oni_value"] if py_result["oni_value"] is not None else "N/A")
+
+            with st.expander("📄 Full JSON response"):
+                st.json(py_result)
+
+            st.markdown("---")
+
+            with st.spinner("⏳ Running Haskell crop recommendation..."):
+                hs_output = run_haskell_recommendation(
+                    state, season, crop, binary_ready
+                )
+            st.success("✅ Haskell recommendation completed.")
+
+            st.markdown("## 🌾 Crop Recommendation")
+            st.code(hs_output, language="text")
+
+        except Exception as e:
+            st.error(f"❌ Pipeline failed: {e}")
+
+    else:
+        st.markdown("## How it works")
+        st.write(
+            "1. Choose your State, Season, Crop, and ENSO mode in the sidebar.\n"
+            "2. Python predicts ENSO and rainfall and writes `forecast.json`.\n"
+            "3. Haskell reads `forecast.json` and returns crop risk + recommendations.\n"
+            "4. Results appear here."
+        )
+
+
+if __name__ == "__main__":
+    main()
