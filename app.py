@@ -1,5 +1,6 @@
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -16,22 +17,11 @@ DATA_PATH       = BASE_DIR / "final_crop_dataset_complete.csv"
 PREDICT_SCRIPT  = BASE_DIR / "python" / "predict.py"
 HASKELL_DIR     = BASE_DIR / "haskell"
 HASKELL_SRC     = HASKELL_DIR / "crop_recommend.hs"
-
-# FIX: Use compiled binary if available; fall back to runhaskell
 HASKELL_BINARY  = HASKELL_DIR / "crop_recommend"
 
 
-# ============================================
-# COMPILE HASKELL ONCE PER SESSION
-# FIX: avoids recompiling on every request
-# ============================================
-
 @st.cache_resource
 def compile_haskell():
-    """
-    Compiles the Haskell script to a binary on first run.
-    Returns True if binary is ready, False if compilation failed.
-    """
     if HASKELL_BINARY.exists():
         return True, "Pre-compiled binary found."
 
@@ -39,20 +29,17 @@ def compile_haskell():
         return False, f"Haskell source not found at {HASKELL_SRC}"
 
     result = subprocess.run(
-        ["ghc", "-O2", "-o", str(HASKELL_BINARY), str(HASKELL_SRC)],
-        capture_output=True, text=True, cwd=str(HASKELL_DIR)
+        ["ghc", "-O2", "-o", str(HASKELL_BINARY), str(HASKELL_SRC.name)],
+        capture_output=True,
+        text=True,
+        cwd=str(HASKELL_DIR)
     )
 
     if result.returncode == 0:
         return True, "Compiled successfully."
     else:
-        # Fall back gracefully to runhaskell
         return False, result.stderr.strip()
 
-
-# ============================================
-# DATA LOADING
-# ============================================
 
 @st.cache_data
 def load_dataset():
@@ -95,12 +82,7 @@ def load_metadata():
     return states, seasons, years, crops, state_col, season_col
 
 
-# ============================================
-# FIX: Input validation before calling Haskell
-# ============================================
-
 def validate_combo(df, state_col, season_col, state, season):
-    """Returns True if the state+season combo has records in the dataset."""
     sub = df[
         (df[state_col].astype(str) == state) &
         (df[season_col].astype(str) == season)
@@ -108,23 +90,25 @@ def validate_combo(df, state_col, season_col, state, season):
     return len(sub) > 0, len(sub)
 
 
-# ============================================
-# PYTHON PREDICTION
-# ============================================
-
 def run_python_prediction(state, season, year, enso_mode, manual_phase=None):
     cmd = [
-        "python", str(PREDICT_SCRIPT),
-        "--state",     state,
-        "--season",    season,
-        "--year",      str(year),
+        sys.executable,
+        str(PREDICT_SCRIPT),
+        "--state", state,
+        "--season", season,
+        "--year", str(year),
         "--enso-mode", enso_mode
     ]
 
     if enso_mode == "manual" and manual_phase:
         cmd.extend(["--manual-phase", manual_phase])
 
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=str(BASE_DIR)
+    )
 
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "Python prediction failed.")
@@ -132,20 +116,11 @@ def run_python_prediction(state, season, year, enso_mode, manual_phase=None):
     return json.loads(result.stdout)
 
 
-# ============================================
-# HASKELL RECOMMENDATION
-# FIX: Uses compiled binary; falls back to runhaskell
-# FIX: Sends via stdin (matches getLine in Haskell)
-# ============================================
-
-def run_haskell_recommendation(state, season, crop):
-    cmd = [
-        "runhaskell",
-        HASKELL_SCRIPT.name,
-        state,
-        season,
-        crop
-    ]
+def run_haskell_recommendation(state, season, crop, binary_ready):
+    if binary_ready and HASKELL_BINARY.exists():
+        cmd = [str(HASKELL_BINARY), state, season, crop]
+    else:
+        cmd = ["runhaskell", HASKELL_SRC.name, state, season, crop]
 
     result = subprocess.run(
         cmd,
@@ -162,15 +137,11 @@ def run_haskell_recommendation(state, season, crop):
 
     return result.stdout.strip()
 
-# ============================================
-# APP
-# ============================================
 
 def main():
     st.title("🌦️ ENSO Agricultural Risk Predictor")
     st.caption("Python predicts rainfall & ENSO → Haskell recommends crops.")
 
-    # Compile Haskell once
     binary_ready, compile_msg = compile_haskell()
     if binary_ready:
         st.sidebar.success(f"✅ Haskell: {compile_msg}")
@@ -186,24 +157,18 @@ def main():
 
     latest_hist_year = max(years)
 
-    # ---- SIDEBAR ----
     with st.sidebar:
         st.header("⚙️ Inputs")
 
-        state  = st.selectbox("State",  states)
+        state  = st.selectbox("State", states)
         season = st.selectbox("Season", seasons)
-        crop   = (
-            st.selectbox("Crop", crops)
-            if crops else st.text_input("Crop")
-        )
+        crop   = st.selectbox("Crop", crops) if crops else st.text_input("Crop")
 
-        # FIX: Validate state+season combo immediately
         valid_combo, record_count = validate_combo(df_raw, state_col, season_col, state, season)
         if valid_combo:
             st.success(f"✅ {record_count} records for this combination")
         else:
-            st.error("❌ No data for this State + Season combination. "
-                     "Haskell will not run.")
+            st.error("❌ No data for this State + Season combination. Haskell will not run.")
 
         enso_mode    = st.selectbox("ENSO Mode", ["historical", "live", "manual"])
         manual_phase = None
@@ -226,27 +191,23 @@ def main():
                 value=max(2026, latest_hist_year + 1),
                 step=1
             )
-            manual_phase = st.selectbox(
-                "Manual ENSO Phase", ["El Nino", "Neutral", "La Nina"]
-            )
+            manual_phase = st.selectbox("Manual ENSO Phase", ["El Nino", "Neutral", "La Nina"])
 
         run_btn = st.button(
             "▶ Run Full Prediction",
             type="primary",
             use_container_width=True,
-            disabled=not valid_combo      # FIX: disable if combo invalid
+            disabled=not valid_combo
         )
 
-    # ---- METRICS ----
     st.subheader("📊 Dataset Coverage")
     c1, c2, c3 = st.columns(3)
-    c1.metric("States",           len(states))
-    c2.metric("Seasons",          len(seasons))
+    c1.metric("States", len(states))
+    c2.metric("Seasons", len(seasons))
     c3.metric("Historical Years", f"{min(years)} – {max(years)}")
 
     st.markdown("---")
 
-    # ---- RUN ----
     if run_btn:
         try:
             with st.spinner("⏳ Running Python climate prediction..."):
@@ -262,14 +223,13 @@ def main():
             st.markdown("## 🌧️ Climate Prediction")
             p1, p2, p3 = st.columns(3)
             p1.metric("Predicted Rainfall (mm)", py_result["predicted_rainfall_mm"])
-            p2.metric("ENSO Phase",              py_result["enso_phase"])
-            p3.metric("Rainfall Category",       py_result["rainfall_category"])
+            p2.metric("ENSO Phase", py_result["enso_phase"])
+            p3.metric("Rainfall Category", py_result["rainfall_category"])
 
             p4, p5, p6 = st.columns(3)
             p4.metric("Historical Normal (mm)", py_result["historical_normal_mm"])
-            p5.metric("Anomaly (%)",            py_result["anomaly_pct"])
-            p6.metric("ONI Value",
-                      py_result["oni_value"] if py_result["oni_value"] is not None else "N/A")
+            p5.metric("Anomaly (%)", py_result["anomaly_pct"])
+            p6.metric("ONI Value", py_result["oni_value"] if py_result["oni_value"] is not None else "N/A")
 
             with st.expander("📄 Full JSON response"):
                 st.json(py_result)
@@ -277,9 +237,7 @@ def main():
             st.markdown("---")
 
             with st.spinner("⏳ Running Haskell crop recommendation..."):
-                hs_output = run_haskell_recommendation(
-                    state, season, crop, binary_ready
-                )
+                hs_output = run_haskell_recommendation(state, season, crop, binary_ready)
             st.success("✅ Haskell recommendation completed.")
 
             st.markdown("## 🌾 Crop Recommendation")
@@ -291,7 +249,7 @@ def main():
     else:
         st.markdown("## How it works")
         st.write(
-            "1. Choose your State, Season, Crop, and ENSO mode in the sidebar.\n"
+            "1. Choose State, Season, Crop, and ENSO mode.\n"
             "2. Python predicts ENSO and rainfall and writes `forecast.json`.\n"
             "3. Haskell reads `forecast.json` and returns crop risk + recommendations.\n"
             "4. Results appear here."
