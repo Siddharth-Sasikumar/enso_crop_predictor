@@ -138,29 +138,29 @@ def run_python_prediction(state, season, year, enso_mode, manual_phase=None):
 # FIX: Sends via stdin (matches getLine in Haskell)
 # ============================================
 
-def run_haskell_recommendation(state, season, crop, binary_ready):
-    # Haskell reads 3 lines from stdin
-    input_data = f"{state}\n{season}\n{crop}\n"
-
-    if binary_ready and HASKELL_BINARY.exists():
-        cmd = [str(HASKELL_BINARY)]
-    else:
-        cmd = ["runhaskell", HASKELL_SRC.name]
+def run_haskell_recommendation(state, season, crop):
+    cmd = [
+        "runhaskell",
+        HASKELL_SCRIPT.name,
+        state,
+        season,
+        crop
+    ]
 
     result = subprocess.run(
         cmd,
-        input=input_data,
         capture_output=True,
         text=True,
-        cwd=str(HASKELL_DIR)
+        cwd=str(HASKELL_DIR),
+        timeout=120
     )
 
     if result.returncode != 0:
-        error_msg = result.stderr.strip() or "Haskell recommendation failed."
-        raise RuntimeError(error_msg)
+        err = result.stderr.strip() if result.stderr else "Haskell recommendation failed."
+        out = result.stdout.strip() if result.stdout else ""
+        raise RuntimeError(f"{err}\n{out}")
 
-    return result.stdout
-
+    return result.stdout.strip()
 
 # ============================================
 # APP
