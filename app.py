@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -115,6 +116,85 @@ def run_haskell_crop_recommend(state, season, crop):
         return {"error": str(e)}
 
 
+def extract_section_lines(text, start_label):
+    lines = text.splitlines()
+    start_idx = None
+
+    for i, line in enumerate(lines):
+        if start_label.lower() in line.lower():
+            start_idx = i + 1
+            break
+
+    if start_idx is None:
+        return []
+
+    collected = []
+    for line in lines[start_idx:]:
+        s = line.strip()
+
+        if not s:
+            continue
+
+        if s.startswith("=============================="):
+            break
+
+        if s.lower().startswith("top 3 ") and start_label.lower() not in s.lower():
+            break
+
+        collected.append(s)
+
+    return collected
+
+
+def parse_crop_table(lines):
+    rows = []
+
+    pattern = re.compile(
+        r"^(.*?)\s+\|\s+Risk:\s+([0-9.]+)\s+\((.*?)\)\s+\|\s+Est\.\s+Yield:\s+([0-9.]+)\s+tons/ha$"
+    )
+
+    for line in lines:
+        m = pattern.match(line)
+        if m:
+            rows.append({
+                "Crop": m.group(1).strip(),
+                "Risk Score": float(m.group(2)),
+                "Risk Level": m.group(3).strip(),
+                "Estimated Yield (tons/ha)": float(m.group(4))
+            })
+
+    return pd.DataFrame(rows)
+
+
+def split_haskell_output(raw_text):
+    safer_lines = extract_section_lines(raw_text, "Top 3 Safer Alternatives")
+    risky_lines = extract_section_lines(raw_text, "Top 3 Riskiest Crops")
+
+    safer_df = parse_crop_table(safer_lines)
+    risky_df = parse_crop_table(risky_lines)
+
+    cleaned_text = []
+    for line in raw_text.splitlines():
+        low = line.lower().strip()
+
+        if low.startswith("top 3 safer alternatives"):
+            continue
+        if low.startswith("top 3 riskiest crops"):
+            continue
+
+        is_table_row = "| Risk:" in line and "| Est. Yield:" in line
+        if is_table_row:
+            continue
+
+        cleaned_text.append(line)
+
+    return {
+        "safer_df": safer_df,
+        "risky_df": risky_df,
+        "cleaned_text": "\n".join(cleaned_text).strip()
+    }
+
+
 def main():
     st.title("🌦️ ENSO Agricultural Risk Predictor")
     st.caption("Python predicts rainfall & ENSO → Haskell recommends crops.")
@@ -200,7 +280,10 @@ def main():
             p4, p5, p6 = st.columns(3)
             p4.metric("Historical Normal (mm)", py_result["historical_normal_mm"])
             p5.metric("Anomaly (%)", py_result["anomaly_pct"])
-            p6.metric("ONI Value", py_result["oni_value"] if py_result["oni_value"] is not None else "N/A")
+            p6.metric(
+                "ONI Value",
+                py_result["oni_value"] if py_result["oni_value"] is not None else "N/A"
+            )
 
             with st.expander("📄 Full JSON response"):
                 st.json(py_result)
@@ -219,7 +302,27 @@ def main():
             else:
                 st.success("✅ Haskell recommendation completed.")
                 st.markdown("## 🌾 Crop Recommendation")
-                st.code(hs_result["output"], language="text")
+
+                parsed = split_haskell_output(hs_result["output"])
+
+                if parsed["cleaned_text"]:
+                    st.code(parsed["cleaned_text"], language="text")
+
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    st.markdown("### Recommended Alternatives")
+                    if not parsed["safer_df"].empty:
+                        st.table(parsed["safer_df"])
+                    else:
+                        st.info("No safer crop alternatives found.")
+
+                with col2:
+                    st.markdown("### High-Risk Crops")
+                    if not parsed["risky_df"].empty:
+                        st.table(parsed["risky_df"])
+                    else:
+                        st.info("No risky crop comparison available.")
 
         except Exception as e:
             st.error(f"❌ Pipeline failed: {e}")
